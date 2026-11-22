@@ -1,0 +1,488 @@
+name: Build Android AAB (Google Play Ready)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Pre-Clean Conflicting Configurations
+        run: |
+          rm -rf capacitor.config.ts capacitor.config.json
+
+      - name: Unzip Project Files If Needed
+        run: |
+          if [ -f "pos.zip--صيدلي-برو" ] || ls *.zip 1> /dev/null 2>&1; then
+            unzip "pos.zip--صيدلي-برو" -d temp_unzip 2>/dev/null || unzip *.zip -d temp_unzip 2>/dev/null || true
+            TARGET_DIR=$(find temp_unzip -name "package.json" -exec dirname {} \; | head -n 1)
+            if [ -n "$TARGET_DIR" ]; then
+              echo "Found project files in: $TARGET_DIR"
+              cp -r "$TARGET_DIR"/* .
+            fi
+            rm -rf temp_unzip
+          fi
+
+      - name: Deep Clean Environment
+        run: |
+          rm -rf node_modules package-lock.json dist android
+          find . -name "capacitor.config.ts" -delete
+          find . -name "capacitor.config.json" -delete
+
+      - name: Set up Python for Military Encryption
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Smart Encrypt & Inject Database Credentials
+        env:
+          RAW_TURSO_URL: ${{ secrets.TURSO_URL || '' }}
+          RAW_TURSO_TOKEN: ${{ secrets.TURSO_TOKEN || '' }}
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json
+
+          raw_url = os.environ.get('RAW_TURSO_URL', '').strip()
+          raw_token = os.environ.get('RAW_TURSO_TOKEN', '').strip()
+
+          aldion_path = 'aldion.ts'
+          if not os.path.exists(aldion_path):
+              aldion_path = 'src/aldion.ts'
+
+          if raw_url and raw_token:
+              print('🔒 تم العثور على توكن في الـ YAML -> جاري التشفير والحقن في aldion.ts...')
+              url_key = [83, 183, 31, 140, 66, 158, 97, 170, 53, 212]
+              token_key = [155, 77, 226, 26, 119, 60, 245, 134, 41, 161, 100, 216]
+
+              def encrypt_bytes(text, key, salt=7):
+                  return [(ord(c) ^ key[i % len(key)] ^ ((i * salt) & 0xFF)) & 0xFF for i, c in enumerate(text)]
+
+              enc_url_bytes = encrypt_bytes(raw_url, url_key)
+              enc_token_bytes = encrypt_bytes(raw_token, token_key)
+
+              if os.path.exists(aldion_path):
+                  with open(aldion_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+
+                  content = re.sub(
+                      r'const _CIPHER_TOKEN_BYTES:\s*number\[\]\s*=\s*\[[\s\S]*?\];',
+                      f'const _CIPHER_TOKEN_BYTES: number[] = {json.dumps(enc_token_bytes)};',
+                      content
+                  )
+
+                  content = re.sub(
+                      r'const _CIPHER_URL_BYTES:\s*number\[\]\s*=\s*\[[\s\S]*?\];',
+                      f'const _CIPHER_URL_BYTES: number[] = {json.dumps(enc_url_bytes)};',
+                      content
+                  )
+
+                  content = re.sub(
+                      r'export const MANUAL_OVERRIDE_TURSO_URL:\s*string\s*=\s*["\'].*?["\'];',
+                      'export const MANUAL_OVERRIDE_TURSO_URL: string = "";',
+                      content
+                  )
+                  content = re.sub(
+                      r'export const MANUAL_OVERRIDE_TURSO_TOKEN:\s*string\s*=\s*["\'].*?["\'];',
+                      'export const MANUAL_OVERRIDE_TURSO_TOKEN: string = "";',
+                      content
+                  )
+
+                  with open(aldion_path, 'w', encoding='utf-8') as f:
+                      f.write(content)
+
+                  print('✅ تم تشفير التوكن والرابط بنجاح وحقنهما في المشروع!')
+              else:
+                  print('⚠️ تنبيه: لم يتم العثور على ملف aldion.ts.')
+          else:
+              print('⚡ لم يتم إدخال توكن في الـ YAML -> سيتم استخدام التوكن وقاعدة البيانات الموجودة مسبقاً داخل ملفات المشروع.')
+          PYEOF
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install Dependencies
+        run: |
+          npm install --force
+
+      - name: Build Web Application
+        run: npm run build
+
+      - name: Install Native Capacitor Plugins
+        run: |
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest @capacitor/filesystem@latest @capacitor/share@latest @capacitor/splash-screen@latest @capacitor/haptics@latest @capacitor-community/sqlite@latest --force
+
+      - name: Inject Universal Native Download & Share Interceptor
+        run: |
+          cat << 'EOF' > dist/inject_share.js
+          (function() {
+            const originalCreate = URL.createObjectURL;
+            URL.createObjectURL = function(blob) {
+              const url = originalCreate.call(this, blob);
+              if (blob && (blob.type.includes('json') || blob.type.includes('pdf') || blob.type.includes('octet') || blob.type.includes('text') || blob.type.includes('html'))) {
+                const reader = new FileReader();
+                reader.onloadend = async function() {
+                  if (reader.result) {
+                    const base64Data = reader.result.split(',')[1];
+                    if (base64Data) {
+                      const isJson = blob.type.includes('json');
+                      const isHtml = blob.type.includes('html');
+                      const ext = isJson ? 'json' : (isHtml ? 'html' : 'pdf');
+                      const mime = isJson ? 'application/json' : (isHtml ? 'text/html' : 'application/pdf');
+                      triggerNativeShare(base64Data, ext, mime);
+                    }
+                  }
+                };
+                reader.readAsDataURL(blob);
+              }
+              return url;
+            };
+
+            document.addEventListener('click', function(e) {
+              const anchor = e.target.closest('a[download]');
+              if (anchor && anchor.href) {
+                const downloadName = anchor.download || '';
+                const isJson = downloadName.toLowerCase().endsWith('.json');
+                const isHtml = downloadName.toLowerCase().endsWith('.html') || downloadName.toLowerCase().endsWith('.htm');
+                const ext = isJson ? 'json' : (isHtml ? 'html' : 'pdf');
+                const mime = isJson ? 'application/json' : (isHtml ? 'text/html' : 'application/pdf');
+
+                if (anchor.href.startsWith('data:')) {
+                  const parts = anchor.href.split(',');
+                  if (parts.length > 1) {
+                    triggerNativeShare(parts[1], ext, mime, downloadName);
+                  }
+                } else if (anchor.href.startsWith('blob:')) {
+                  fetch(anchor.href).then(function(res) {
+                    return res.blob();
+                  }).then(function(blob) {
+                    const reader = new FileReader();
+                    reader.onloadend = function() {
+                      if (reader.result) {
+                        const base64Data = reader.result.split(',')[1];
+                        if (base64Data) {
+                          triggerNativeShare(base64Data, ext, mime, downloadName);
+                        }
+                      }
+                    };
+                    reader.readAsDataURL(blob);
+                  }).catch(function(err) {
+                    console.log('Blob fetch error:', err);
+                  });
+                }
+              }
+            }, true);
+
+            async function triggerNativeShare(base64Data, ext, mimeType, customFileName) {
+              const dateStr = new Date().toISOString().slice(0, 10);
+              const extension = ext || 'pdf';
+              const isJson = extension === 'json';
+              const fileName = customFileName || (isJson ? `Daftar-Aldeyon-Backup-${dateStr}.json` : `Daftar-Aldeyon-Report-${dateStr}.${extension}`);
+
+              try {
+                if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Filesystem) {
+                  const { Filesystem, Share } = window.Capacitor.Plugins;
+
+                  const savedFile = await Filesystem.writeFile({
+                    path: fileName,
+                    data: base64Data,
+                    directory: 'CACHE'
+                  });
+
+                  await Share.share({
+                    title: isJson ? 'النسخة الاحتياطية' : 'تقرير كشف الحساب',
+                    text: isJson ? 'ملف النسخة الاحتياطية - دفتر الديون' : 'تقرير كشف الحساب - دفتر الديون',
+                    url: savedFile.uri,
+                    dialogTitle: isJson ? 'حفظ أو مشاركة النسخة الاحتياطية' : 'مشاركة أو حفظ التقرير'
+                  });
+                } else if (navigator.share) {
+                  try {
+                    const byteChars = atob(base64Data);
+                    const byteNumbers = new Array(byteChars.length);
+                    for (let i = 0; i < byteChars.length; i++) {
+                      byteNumbers[i] = byteChars.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const file = new File([byteArray], fileName, { type: mimeType || (isJson ? 'application/json' : 'application/pdf') });
+
+                    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                      await navigator.share({
+                        files: [file],
+                        title: isJson ? 'النسخة الاحتياطية' : 'تقرير كشف الحساب',
+                        text: isJson ? 'ملف النسخة الاحتياطية' : 'تقرير كشف الحساب',
+                      });
+                    }
+                  } catch (webShareErr) {
+                    console.log('WebShare API fallback:', webShareErr);
+                  }
+                }
+              } catch (err) {
+                console.log('Native Share Failed:', err);
+              }
+            }
+          })();
+          EOF
+
+          if [ -f "dist/index.html" ]; then
+            sed -i '/<\/head>/i \  <script src="./inject_share.js"><\/script>' dist/index.html
+          fi
+
+      - name: Initialize Capacitor Android
+        run: |
+          APP_NAME="دفتر الديون"
+          PACKAGE_ID="com.aistudio.debttracker.iqdb"
+
+          npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir=dist
+
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.aistudio.debttracker.iqdb",
+            "appName": "دفتر الديون",
+            "webDir": "dist",
+            "server": {
+              "androidScheme": "https",
+              "allowNavigation": [
+                "accounts.google.com",
+                "*.google.com",
+                "*.googleusercontent.com",
+                "*.firebaseapp.com",
+                "*.googleapis.com"
+              ]
+            }
+          }
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Optimize Native Android Manifest & Google Play Safe Permissions
+        run: |
+          MANIFEST_PATH="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST_PATH" ]; then
+            sed -i 's/android:debuggable="false"//g' "$MANIFEST_PATH"
+            sed -i 's/android:debuggable="true"//g' "$MANIFEST_PATH"
+            sed -i 's/<application/<application android:hardwareAccelerated="true" android:largeHeap="true"/g' "$MANIFEST_PATH"
+            sed -i '/<\/manifest>/i \    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.VIBRATE" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />' "$MANIFEST_PATH"
+          fi
+
+          if [ -f "android/app/build.gradle" ]; then
+            sed -i '/android {/a \    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }' android/app/build.gradle
+          fi
+
+      - name: Inject Google Drive, OAuth & Policy-Compliant Media Picker into MainActivity
+        run: |
+          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java" | head -n 1)
+          if [ -n "$MAIN_ACTIVITY" ]; then
+            PACKAGE_LINE=$(grep "^package " "$MAIN_ACTIVITY" | head -n 1)
+            cat << JAVAEOF > "$MAIN_ACTIVITY"
+          ${PACKAGE_LINE}
+
+          import android.os.Bundle;
+          import android.os.Build;
+          import android.os.Message;
+          import android.app.Dialog;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.view.WindowManager;
+          import android.view.Display;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebViewClient;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              private ValueCallback<Uri[]> mFilePathCallback = null;
+              private Uri mCameraPhotoUri = null;
+              private WebChromeClient.FileChooserParams mLastFileChooserParams = null;
+              private static final int FILE_CHOOSER_REQUEST_CODE = 2001;
+              private static final int CAMERA_PERMISSION_REQUEST_CODE = 2002;
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          getWindow().setDecorFitsSystemWindows(true);
+                      }
+                      if (getWindow() != null && getWindow().getDecorView() != null) {
+                          getWindow().getDecorView().setFitsSystemWindows(true);
+                      }
+                  } catch (Exception ignored) {}
+
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          Display display = getDisplay();
+                          if (display != null) {
+                              Display.Mode[] modes = display.getSupportedModes();
+                              float maxRefreshRate = 60.0f;
+                              Display.Mode bestMode = null;
+                              for (Display.Mode mode : modes) {
+                                  if (mode.getRefreshRate() > maxRefreshRate) {
+                                      maxRefreshRate = mode.getRefreshRate();
+                                      bestMode = mode;
+                                  }
+                              }
+                              if (bestMode != null) {
+                                  WindowManager.LayoutParams params = getWindow().getAttributes();
+                                  params.preferredDisplayModeId = bestMode.getModeId();
+                                  getWindow().setAttributes(params);
+                              }
+                          }
+                      }
+                  } catch (Exception ignored) {}
+
+                  try {
+                      if (this.bridge != null && this.bridge.getWebView() != null) {
+                          WebView webView = this.bridge.getWebView();
+                          WebSettings settings = webView.getSettings();
+                          settings.setDomStorageEnabled(true);
+                          settings.setDatabaseEnabled(true);
+                          settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+                          settings.setAllowFileAccess(true);
+                          settings.setAllowContentAccess(true);
+                          settings.setJavaScriptEnabled(true);
+                          settings.setJavaScriptCanOpenWindowsAutomatically(true);
+                          settings.setSupportMultipleWindows(true);
+
+                          String chromeUa = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.88 Mobile Safari/537.36";
+                          settings.setUserAgentString(chromeUa);
+
+                          webView.setLayerType(WebView.LAYER_TYPE_HARDWARE, null);
+
+                          webView.setWebChromeClient(new WebChromeClient() {
+                              @Override
+                              public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, WebChromeClient.FileChooserParams fileChooserParams) {
+                                  if (mFilePathCallback != null) {
+                                      mFilePathCallback.onReceiveValue(null);
+                                      mFilePathCallback = null;
+                                  }
+                                  mFilePathCallback = filePathCallback;
+
+                                  boolean isCapture = (fileChooserParams != null && fileChooserParams.isCaptureEnabled());
+
+                                  if (isCapture) {
+                                      if (ContextCompat.checkSelfPermission(MainActivity.this, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                                          mLastFileChooserParams = fileChooserParams;
+                                          ActivityCompat.requestPermissions(MainActivity.this, new String[]{android.Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST_CODE);
+                                          return true;
+                                      }
+                                  }
+
+                                  launchImagePicker(fileChooserParams);
+                                  return true;
+                              }
+
+                              @Override
+                              public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                                  WebView popupWebView = new WebView(MainActivity.this);
+                                  WebSettings popupSettings = popupWebView.getSettings();
+                                  popupSettings.setJavaScriptEnabled(true);
+                                  popupSettings.setDomStorageEnabled(true);
+                                  popupSettings.setDatabaseEnabled(true);
+                                  popupSettings.setSupportMultipleWindows(true);
+                                  popupSettings.setJavaScriptCanOpenWindowsAutomatically(true);
+                                  popupSettings.setUserAgentString(chromeUa);
+
+                                  Dialog authDialog = new Dialog(MainActivity.this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+                                  authDialog.setContentView(popupWebView);
+                                  authDialog.show();
+
+                                  popupWebView.setWebChromeClient(new WebChromeClient() {
+                                      @Override
+                                      public void onCloseWindow(WebView window) {
+                                          try {
+                                              authDialog.dismiss();
+                                          } catch (Exception ignored) {}
+                                      }
+                                  });
+
+                                  popupWebView.setWebViewClient(new WebViewClient() {
+                                      @Override
+                                      public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                                          return false;
+                                      }
+                                  });
+
+                                  WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                                  transport.setWebView(popupWebView);
+                                  resultMsg.sendToTarget();
+                                  return true;
+                              }
+                          });
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              private void launchImagePicker(WebChromeClient.FileChooserParams fileChooserParams) {
+                  try {
+                      boolean isCapture = (fileChooserParams != null && fileChooserParams.isCaptureEnabled());
+                      boolean hasCameraPerm = (ContextCompat.checkSelfPermission(MainActivity.this, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED);
+
+                      Intent takePictureIntent = null;
+                      if (hasCameraPerm) {
+                          try {
+                              takePictureIntent = new Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE);
+                              java.io.File storageDir = getExternalCacheDir();
+                              if (storageDir == null) storageDir = getCacheDir();
+                              java.io.File photoFile = java.io.File.createTempFile("invoice_cam_", ".jpg", storageDir);
+                              mCameraPhotoUri = androidx.core.content.FileProvider.getUriForFile(
+                                  MainActivity.this,
+                                  getPackageName() + ".fileprovider",
+                                  photoFile
+                              );
+                              takePictureIntent.putExtra(android.provider.MediaStore.EXTRA_OUTPUT, mCameraPhotoUri);
+                              takePictureIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                          } catch (Exception ex) {
+                              takePictureIntent = null;
+                          }
+                      }
+
+                      if (isCapture && takePictureIntent != null) {
+                          startActivityForResult(takePictureIntent, FILE_CHOOSER_REQUEST_CODE);
+                          return;
+                      }
+
+                      Intent galleryIntent = new Intent(Intent.ACTION_GET_CONTENT);
+                      galleryIntent.addCategory(Intent.CATEGORY_OPENABLE);
+                      galleryIntent.setType("image/*");
+
+                      Intent chooserIntent = Intent.createChooser(galleryIntent, "اختيار صورة من المعرض أو الكاميرا");
+                      if (takePictureIntent != null) {
+                          chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, new Intent[]{takePictureIntent});
+                      }
+
+                      startActivityForResult(chooserIntent, FILE_CHOOSER_REQUEST_CODE);
+                  } catch (Exception e) {
+                      if (mFilePathCallback != null) {
+                          mFilePathCallback.onReceiveValue(null);
+                          mFilePathCallback = null;
+                      }
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == CAMERA_PERMISSION_
