@@ -287,12 +287,7 @@ jobs:
 
       - name: Inject Google Drive, OAuth & Policy-Compliant Media Picker into MainActivity
         run: |
-          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java" | head -n 1)
-          if [ -n "$MAIN_ACTIVITY" ]; then
-            PACKAGE_LINE=$(grep "^package " "$MAIN_ACTIVITY" | head -n 1)
-            cat << JAVAEOF > "$MAIN_ACTIVITY"
-          ${PACKAGE_LINE}
-
+          cat << 'JAVAEOF' > /tmp/MainActivityTemplate.java
           import android.os.Bundle;
           import android.os.Build;
           import android.os.Message;
@@ -485,4 +480,163 @@ jobs:
               @Override
               public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-                  if (requestCode == CAMERA_PERMISSION_
+                  if (requestCode == CAMERA_PERMISSION_REQUEST_CODE) {
+                      launchImagePicker(mLastFileChooserParams);
+                      mLastFileChooserParams = null;
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
+                      if (mFilePathCallback == null) return;
+                      Uri[] results = null;
+                      if (resultCode == RESULT_OK) {
+                          if (data != null && data.getData() != null) {
+                              results = new Uri[]{data.getData()};
+                          } else if (data != null && data.getClipData() != null) {
+                              int numSelected = data.getClipData().getItemCount();
+                              results = new Uri[numSelected];
+                              for (int i = 0; i < numSelected; i++) {
+                                  results[i] = data.getClipData().getItemAt(i).getUri();
+                              }
+                          } else if (mCameraPhotoUri != null) {
+                              results = new Uri[]{mCameraPhotoUri};
+                          }
+                      }
+                      mFilePathCallback.onReceiveValue(results);
+                      mFilePathCallback = null;
+                  }
+              }
+          }
+          JAVAEOF
+
+          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java" | head -n 1)
+          if [ -n "$MAIN_ACTIVITY" ]; then
+            PACKAGE_LINE=$(grep "^package " "$MAIN_ACTIVITY" | head -n 1)
+            printf "%s\n\n" "$PACKAGE_LINE" > "$MAIN_ACTIVITY"
+            cat /tmp/MainActivityTemplate.java >> "$MAIN_ACTIVITY"
+            echo "✅ تم تحديث MainActivity.java بنجاح!"
+          else
+            echo "❌ لم يتم العثور على MainActivity.java"
+            exit 1
+          fi
+
+      - name: Generate Multi-Resolution App Icons
+        run: |
+          python3 -m pip install pillow
+          python3 << 'PYEOF'
+          import os
+          from PIL import Image
+
+          sizes = {
+              'mipmap-mdpi': 48,
+              'mipmap-hdpi': 72,
+              'mipmap-xhdpi': 96,
+              'mipmap-xxhdpi': 144,
+              'mipmap-xxxhdpi': 192
+          }
+
+          icon_path = 'icon.png'
+          if not os.path.exists(icon_path):
+              icon_path = 'public/icon.png'
+
+          if os.path.exists(icon_path):
+              img = Image.open(icon_path).convert('RGBA')
+              res_dir = 'android/app/src/main/res'
+
+              for folder, size in sizes.items():
+                  target_dir = os.path.join(res_dir, folder)
+                  os.makedirs(target_dir, exist_ok=True)
+                  resized = img.resize((size, size), Image.Resampling.LANCZOS)
+
+                  for fname in ['ic_launcher.png', 'ic_launcher_round.png', 'ic_launcher_foreground.png']:
+                      resized.save(os.path.join(target_dir, fname))
+              print('✅ Successfully generated launcher icons!')
+          PYEOF
+
+      - name: Update Kotlin & Gradle Versions for Java 21
+        run: |
+          cd android
+          if [ -f "build.gradle" ]; then
+            sed -i 's/ext.kotlin_version = .*/ext.kotlin_version = "1.9.24"/g' build.gradle
+            sed -i 's/kotlin_version = .*/kotlin_version = "1.9.24"/g' build.gradle
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: Cache Gradle Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build & Sign Release AAB with Persistent Key
+        run: |
+          cd android
+          chmod +x gradlew
+
+          if [ -f "../daftar_release.keystore" ]; then
+            cp ../daftar_release.keystore release.keystore
+            echo "✅ تم استخدام المفتاح الثابت: daftar_release.keystore"
+          elif [ -f "../release.keystore" ]; then
+            cp ../release.keystore release.keystore
+            echo "✅ تم استخدام المفتاح الثابت: release.keystore"
+          else
+            echo "⚠️ تنبيه: لم يتم العثور على المفتاح الثابت، جاري توليد مفتاح جديد..."
+            keytool -genkeypair -v -keystore release.keystore -alias daftar_key -keyalg RSA -keysize 2048 -validity 10000 -storepass "DaftarPass2026" -keypass "DaftarPass2026" -dname "CN=DaftarAldeyon, OU=App, O=Daftar, L=Baghdad, S=Baghdad, C=IQ" -storetype PKCS12
+          fi
+
+          RUN_NUM=${{ github.run_number }}
+          if [ -f "app/build.gradle" ]; then
+            sed -i -E "s/versionCode [0-9]+/versionCode $RUN_NUM/g" app/build.gradle || true
+            sed -i -E "s/versionName \"[^\"]+\"/versionName \"1.0.$RUN_NUM\"/g" app/build.gradle || true
+          fi
+
+          ./gradlew bundleRelease --no-daemon -Dorg.gradle.project.android.useAndroidX=true
+
+          DATE_STR=$(date +'%Y-%m-%d')
+          FINAL_AAB_NAME="Daftar-Aldeyon-${DATE_STR}-v${RUN_NUM}.aab"
+          TARGET_AAB=$(find app/build/outputs/bundle/release/ -type f -name "*.aab" | head -n 1)
+
+          cp "$TARGET_AAB" "app/build/outputs/bundle/release/${FINAL_AAB_NAME}"
+
+          KEY_ALIAS=$(keytool -list -keystore release.keystore -storepass "DaftarPass2026" | grep -i "PrivateKeyEntry" | head -n 1 | awk -F',' '{print $1}' | xargs)
+          KEY_ALIAS=${KEY_ALIAS:-daftar_key}
+
+          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+            -keystore release.keystore \
+            -storepass "DaftarPass2026" \
+            -keypass "DaftarPass2026" \
+            "app/build/outputs/bundle/release/${FINAL_AAB_NAME}" "$KEY_ALIAS"
+
+          jarsigner -verify -verbose -certs "app/build/outputs/bundle/release/${FINAL_AAB_NAME}"
+
+      - name: Upload Signed AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: Daftar-Aldeyon-AAB
+          path: android/app/build/outputs/bundle/release/Daftar-Aldeyon-*.aab
+
+      - name: Create GitHub Release with AAB
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          files: android/app/build/outputs/bundle/release/Daftar-Aldeyon-*.aab
+          name: "إصدار تطبيق دفتر الديون AAB v${{ github.run_number }}"
+          tag_name: "v${{ github.run_number }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
